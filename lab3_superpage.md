@@ -251,3 +251,84 @@ superpg_free()
    First, anyone who attempts the lab should read this webpage and setup the environment first: https://pdos.csail.mit.edu/6.828/2025/tools.html
 
    Please note that certain Linux distros, such as Ubuntu LTS, does not have the required version. I had to manually install QEMU 7.X to run xv6 in a virtual machine.
+
+   I found it is useful to use `~/.gdbinit` to preload some configurations for each session. Here is my very short file:
+
+```bash
+set auto-load local-gdbinit on
+set auto-load safe-path /
+add-symbol-file ./user/_pgtbltest
+layout src    
+```
+
+   The second line enables xv6 debugging, otherwise gdb does not attach to the kernel, at least it was my experience. The third line loads the symbols of `pgtbltest.c` so that I can break in this file. The last line switches the layout to `src`. You might find other useful options, but this is good enough for me at the moment.
+
+   I'm still trying to figure out some issues I encountered in debugging. I suspect they have something to do with compiler optimization (which causes compiler to skip over source code).
+   - Sometimes gdb skips code. gdb never breaks on assignment, which I get and am fine with it, but sometimes it seems to skip important lines.
+   - Sometimes gdbbreaks at a place (e.g. `b pgtbltest.c:xxx`) without the program being run at all. It could break at the place even before shell shows up, and I so far haven't figured out the why. I had to input `c` multiple times, to reach the real breakpoint.
+
+   Some other tips when debugging user land. 
+   - xv6 context switches between kernel and user for each system call. Simply stepping through each step does not work as gdb loses track during the context switch. I guess `layout asm` might work to some extend but I never validated that.
+   - What I did is to recognize each system call function -- most of the time it is the `sys_???` function, and set a breakpoint at that function. Once `ecall` is executed, gdb should break at exactly the place you want it to.
+   - To debug memory allocation and deallocation, we need to understand how xv6 allocate/deallocate memory, how it organizes phsyical memory, and how it maps virtual addresses to physcial addresses. I'll discuss my findings in the next chapter.
+
+
+### Memory allocation overview
+
+To understand memory allocation of a user process, it is essential to step through the whole process from its birth to its death. Except for the initial user process, every other process, including the shell, starts from `kfork()` call from its parent process. Just a note that I may skip some function calls and focus on the more important ones.
+
+```C
+int
+kfork(void)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc()) == 0){
+    return -1;
+  }
+
+  // Copy user memory from parent to child.
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  np->sz = p->sz;
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  /* WHY: Should we copy usys too? (This is for USYSCALL) */
+  #ifdef LAB_PGTBL
+    // *(np->usys) = *(p->usys);
+  #endif
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+```
