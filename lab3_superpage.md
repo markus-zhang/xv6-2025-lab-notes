@@ -277,6 +277,8 @@ layout src
 
 To understand memory allocation of a user process, it is essential to step through the whole process from its birth to its death. Except for the initial user process, every other process, including the shell, starts from `kfork()` call from its parent process. Just a note that I may skip some function calls and focus on the more important ones.
 
+xv6 uses paging, which means each allocation and deallocation are aligned at 4KB boundary. This is why in some of the original comments and code you will see a check against alignment, and `panic` if the addresses (virtual or physical ones) are not. Some functions do not expect the caller to watch alignment and we will talke about them one by one later.
+
 ```C
 int
 kfork(void)
@@ -291,6 +293,8 @@ kfork(void)
   }
 
   // Copy user memory from parent to child.
+  // uvmcopy() copies BOTH the page table as well as the physical memory the entries point to
+  // This means if the parent process allocates 16MB of memory, its child process would need approximately the same amount of memory during `kfork()`
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
@@ -304,17 +308,23 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
-  /* WHY: Should we copy usys too? (This is for USYSCALL) */
-  #ifdef LAB_PGTBL
-    // *(np->usys) = *(p->usys);
-  #endif
+  /*
+    From my understanding, the reasons kfork() nees to do a full copy of the memory of the parent process are:
+    - The scheduler doesn't care whether it is a parent process or a child process, it picks any process that is RUNNABLE
+    - if the child process misses important components, such as stack, then it crashes immediately
+    - so it's kinda easiest just to do a full copy
+
+    Questions though, like, can we simply inject just enough code/data to make a very simple program? Why do we need to do a full copy anyway?
+  */
 
   // increment reference counts on open file descriptors.
+  // I don't understand this part yet, gotta keep going
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // Just to copy name, so if I `p p->name` and `p np->name`, they are the same. Confused me the hell when I just started.
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -326,9 +336,74 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  // So the scheduler could pick np
   np->state = RUNNABLE;
   release(&np->lock);
 
   return pid;
+}
+```
+
+I'll switch to `allocproc()` as it is the first important function call from `kfork()`.
+
+```C
+// Look in the process table for an UNUSED proc.
+// If found, initialize state required to run in the kernel,
+// and return with p->lock held.
+// If there are no free procs, or a memory allocation fails, return 0.
+static struct proc*
+allocproc(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  #ifdef LAB_PGTBL
+  if ((p->usys = (struct usyscall *)kalloc()) == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  // p->usys->pid = p->pid;
+  // memset(p->usys, p->pid, sizeof(int));
+  #endif
+
+  // An empty user page table.
+  p->pagetable = proc_pagetable(p);
+  if(p->pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  p->usys->pid = p->pid;
+
+  return p;
 }
 ```
