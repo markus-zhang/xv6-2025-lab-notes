@@ -456,6 +456,7 @@ kexec(char *path, char **argv)
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
     if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
       goto bad;
+    // If it's not a LOAD section, we don't load (check the map ^)
     if(ph.type != ELF_PROG_LOAD)
       continue;
     if(ph.memsz < ph.filesz)
@@ -465,9 +466,17 @@ kexec(char *path, char **argv)
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
     uint64 sz1;
+    /*
+      I'll go over uvmalloc() in the next chapter because we need to modify it. Adding super pages makes allocation and deallocation much more complicated.
+      In summary, uvmalloc does two things:
+      1. call kalloc() to allocate physical memory
+      2. call mappages() to map virtual addresses to physical addresses
+      Essentially, it performs the service so that the next time the OS access a VA, it can trace it to the PA and do actual stuffs.
+    */
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
       goto bad;
     sz = sz1;
+    // Load program segments, nothing fancy here
     if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
       goto bad;
   }
@@ -481,12 +490,17 @@ kexec(char *path, char **argv)
   // Allocate some pages at the next page boundary.
   // Make the first inaccessible as a stack guard.
   // Use the rest as the user stack.
+
+  // PGROUNDUP() is frequently used to bring a VA to the starting address of next page, because of alignment.
   sz = PGROUNDUP(sz);
   uint64 sz1;
+  // It allocates 2 pages, one for user stack and one for the guard page
   if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
     goto bad;
   sz = sz1;
+  // This is how it setup the guard page. Guard page is just a glorious name for a cleared page. OS screams when it is told to touch a cleared page, so it serves as a "guard" page against bad VA.
   uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  // sp is where stack pointer should be, and stackbase is the base of stack. Stack grows from high address to low address, so sp > stackbase.
   sp = sz;
   stackbase = sp - USERSTACK*PGSIZE;
 
@@ -516,6 +530,8 @@ kexec(char *path, char **argv)
   // a0 and a1 contain arguments to user main(argc, argv)
   // argc is returned via the system call return
   // value, which goes in a0.
+
+  // The ^ is just calling conventions
   p->trapframe->a1 = sp;
 
   // Save program name for debugging.
@@ -530,6 +546,7 @@ kexec(char *path, char **argv)
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
   p->trapframe->sp = sp; // initial stack pointer
+  // OS code is pretty resilience so we need to free our own shit
   proc_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
