@@ -344,66 +344,203 @@ kfork(void)
 }
 ```
 
-I'll switch to `allocproc()` as it is the first important function call from `kfork()`.
+I'm going to ignore as many secondary function call as possible, as we will discuss some of them when we start working on the implementation of Super Page. Once `kfork()` is done, the scheduler kicks into work, and eventually Shell runs `kexec()` for the child process. `exec()` is where the actual text and data sections and other stuffs get allocated and mapped.
 
 ```C
-// Look in the process table for an UNUSED proc.
-// If found, initialize state required to run in the kernel,
-// and return with p->lock held.
-// If there are no free procs, or a memory allocation fails, return 0.
-static struct proc*
-allocproc(void)
+//
+// the implementation of the exec() system call
+//
+int
+kexec(char *path, char **argv)
 {
-  struct proc *p;
+  char *s, *last;
+  int i, off;
+  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+  struct elfhdr elf;
+  struct inode *ip;
+  struct proghdr ph;
+  pagetable_t pagetable = 0, oldpagetable;
+  struct proc *p = myproc();
 
-  for(p = proc; p < &proc[NPROC]; p++) {
-    acquire(&p->lock);
-    if(p->state == UNUSED) {
-      goto found;
-    } else {
-      release(&p->lock);
-    }
+  begin_op();
+
+  // Open the executable file.
+  if((ip = namei(path)) == 0){
+    end_op();
+    return -1;
   }
-  return 0;
+  ilock(ip);
 
-found:
-  p->pid = allocpid();
-  p->state = USED;
+  // Read the ELF header.
+  /*
+    For ELF file, I use `readelf` to inspect the executable. For example, `readelf -h` shows the file header, while `readelf -l` shows the program headers, etc.
+    Assuming cwd is xv6-labs-2025 and you already ran `make qemu` once without issues.
+    $ cd user
+    $ readelf -h _pgtbltest
+    The ^ shell command gives the ELF header information. A more interesting switch is:
+    $ readelf -l _pgtbltest
 
-  // Allocate a trapframe page.
-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
+    Elf file type is EXEC (Executable file)
+    Entry point 0x56c
+    There are 4 program headers, starting at offset 64
+
+    Program Headers:
+    Type           Offset             VirtAddr           PhysAddr
+                   FileSiz            MemSiz              Flags  Align
+    RISCV_ATTRIBUT 0x000000000000ab81 0x0000000000000000 0x0000000000000000
+                   0x0000000000000033 0x0000000000000000  R      0x1
+    LOAD           0x0000000000001000 0x0000000000000000 0x0000000000000000
+                   0x0000000000001211 0x0000000000001211  R E    0x1000
+    LOAD           0x0000000000003000 0x0000000000002000 0x0000000000002000
+                   0x0000000000000010 0x0000000000000030  RW     0x1000
+    GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                   0x0000000000000000 0x0000000000000000  RW     0x10
+
+    Section to Segment mapping:
+    Segment Sections...
+    00     .riscv.attributes 
+    01     .text .rodata 
+    02     .data .bss 
+    03
+
+    You can see the text and data sections in the Program Headers list as two "LOAD" type. How can I decide which one is text and which one is data? We can tell by reading the "Flags". text section is executable but not writable, while data is writable but not executable, so the first LOAD section is the text section (code), while the second LOAD section is the data section. The text section starts at Virtual Address 0x0 and has a size of 0x1211, while the data section starts at 0x2000 and has a size of 0x30.
+
+    Now we must take a detour and read the user address space map to get an idea about how the process address grows:
+    MAXVA-------> --------------------
+                  |   trampoline     |
+                  --------------------
+                  |   trapframe      |
+                  --------------------
+                  |                  |
+                  |                  |
+                  |     unused       |
+                  |                  |
+                  --------------------
+                  |                  |
+                  |                  |
+                  |       heap       |
+                  |                  |
+                  --------------------
+    One 4KB Page->|       stack      |
+                  --------------------
+                  |    guard page    |
+                  --------------------
+                  |                  |
+                  |                  |
+                  |       data       |
+                  |                  |
+                  --------------------
+                  |      unused      |
+                  --------------------
+                  |                  |
+                  |                  |
+                  |       text       |
+                  |                  |
+    0-----------> --------------------
+
+    So in the case of _pgtbltest, the text section takes 2  pages. It only needs 0x1211 bytes but since it goes over one page it has to take two full pages. The data section then starts from 0x2000 and take just one page because it is so small.
+    The rest of kexec() does the work of loading sections into memory.
+                  
+  */
+  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+    goto bad;
+
+  // Is this really an ELF file?
+  if(elf.magic != ELF_MAGIC)
+    goto bad;
+
+  if((pagetable = proc_pagetable(p)) == 0)
+    goto bad;
+
+  // Load program into memory.
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+      goto bad;
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    if(ph.memsz < ph.filesz)
+      goto bad;
+    if(ph.vaddr + ph.memsz < ph.vaddr)
+      goto bad;
+    if(ph.vaddr % PGSIZE != 0)
+      goto bad;
+    uint64 sz1;
+    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
+      goto bad;
+    sz = sz1;
+    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
   }
+  iunlockput(ip);
+  end_op();
+  ip = 0;
 
-  #ifdef LAB_PGTBL
-  if ((p->usys = (struct usyscall *)kalloc()) == 0)
-  {
-    freeproc(p);
-    release(&p->lock);
-    return 0;
+  p = myproc();
+  uint64 oldsz = p->sz;
+
+  // Allocate some pages at the next page boundary.
+  // Make the first inaccessible as a stack guard.
+  // Use the rest as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz1;
+  if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+    goto bad;
+  sz = sz1;
+  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  sp = sz;
+  stackbase = sp - USERSTACK*PGSIZE;
+
+  // Copy argument strings into new stack, remember their
+  // addresses in ustack[].
+  for(argc = 0; argv[argc]; argc++) {
+    if(argc >= MAXARG)
+      goto bad;
+    sp -= strlen(argv[argc]) + 1;
+    sp -= sp % 16; // riscv sp must be 16-byte aligned
+    if(sp < stackbase)
+      goto bad;
+    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
+      goto bad;
+    ustack[argc] = sp;
   }
-  // p->usys->pid = p->pid;
-  // memset(p->usys, p->pid, sizeof(int));
-  #endif
+  ustack[argc] = 0;
 
-  // An empty user page table.
-  p->pagetable = proc_pagetable(p);
-  if(p->pagetable == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
+  // push a copy of ustack[], the array of argv[] pointers.
+  sp -= (argc+1) * sizeof(uint64);
+  sp -= sp % 16;
+  if(sp < stackbase)
+    goto bad;
+  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+    goto bad;
+
+  // a0 and a1 contain arguments to user main(argc, argv)
+  // argc is returned via the system call return
+  // value, which goes in a0.
+  p->trapframe->a1 = sp;
+
+  // Save program name for debugging.
+  for(last=s=path; *s; s++)
+    if(*s == '/')
+      last = s+1;
+  safestrcpy(p->name, last, sizeof(p->name));
+    
+  // Commit to the user image.
+  oldpagetable = p->pagetable;
+  p->pagetable = pagetable;
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
+  p->trapframe->sp = sp; // initial stack pointer
+  proc_freepagetable(oldpagetable, oldsz);
+
+  return argc; // this ends up in a0, the first argument to main(argc, argv)
+
+ bad:
+  if(pagetable)
+    proc_freepagetable(pagetable, sz);
+  if(ip){
+    iunlockput(ip);
+    end_op();
   }
-
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
-  memset(&p->context, 0, sizeof(p->context));
-  p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
-
-  p->usys->pid = p->pid;
-
-  return p;
+  return -1;
 }
 ```
