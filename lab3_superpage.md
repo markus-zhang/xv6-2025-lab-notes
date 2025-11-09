@@ -561,3 +561,49 @@ kexec(char *path, char **argv)
   return -1;
 }
 ```
+
+### Memory allocation for super pages
+
+Allocation for super pages requires three pieces:
+- xv6 needs to locate a chunk of 2MB in a freelist (this is how `kalloc()` works)
+- xv6 needs to know how to map VA to a 2MB PA (create page directory entries)
+- xv6 needs to locate the level-1 PTE that directly points to a 2MB PA (no level-0 PTE in this case)
+
+Since I need to touch kernal land functions, one tip I found to be particularly useful is to create a duplicate function for each one I need to modify/rewrite and then point `pgtbltest.c` to these duplicates. It was a lot of extra work because I needed to create duplicate sys calls too, but it doesn't crash xv6 which is a huge help.
+
+First step is to help xv6 locate a chunk of 2MB in a freelist. I created a `supermem` for this purpose:
+
+```C
+// To be added under freerange() delcatation
+void freesuperrange(void *pa_start, void *pa_end);
+// To be added under kmem declaration
+struct {
+  struct spinlock lock;
+  struct run *freesuperlist;
+} ksupermem;
+
+// kinit() now creates memory as large as 30 super pages for super pages, and move the regular pages above the super pages
+void
+kinit()
+{
+  // Allocate some super pages first
+  initlock(&ksupermem.lock, "ksupermem");
+  // Recall that end is the end of kernel, and kernel uses direct mapping -> kernal VA == PA
+  freesuperrange(end, end + SUPERPGSIZE * 30);
+
+  initlock(&kmem.lock, "kmem");
+  freerange(end + SUPERPGSIZE * 30, (void*)PHYSTOP);
+}
+
+// To be added under freerange() definition
+// It is similar to freerange() except that it uses super page macros the lab provides
+// Combined with kinit(), this creates 30 "nodes" for the super free list
+void
+freesuperrange(void *pa_start, void *pa_end)
+{
+  char *p;
+  p = (char*)SUPERPGROUNDUP((uint64)pa_start);
+  for(; p + SUPERPGSIZE <= (char*)pa_end; p += SUPERPGSIZE)
+    ksuperfree(p);
+}
+```
