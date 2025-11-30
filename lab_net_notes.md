@@ -55,3 +55,8 @@ Base---->   -----------------
 > Shaded boxes in the ^ figure represent descriptors that have stored incoming packets but have not yet been recognized by software.
 
 The problem is, I found that the first "available" descriptor is NOT the tail one, but the (tail + 1) % 16 one. `int i = (e1000_rdt + 1) % RX_RING_SIZE;` this definitely matches what the LAB says but I have no idea why it's the case. It doesn't really match the ^ figure in which Tail points to a shaded box. I can also confirm that looking into GDB, the first packet is stored in descriptor 0, while rdt is 15, and the second packet is stored in descriptor 1, while rdt is 1.
+
+
+## Trial 2
+
+Damn this must be the most confusing lab I ever wrote. WTH is it talking about?
