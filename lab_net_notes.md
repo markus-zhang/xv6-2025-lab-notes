@@ -57,6 +57,18 @@ Base---->   -----------------
 The problem is, I found that the first "available" descriptor is NOT the tail one, but the (tail + 1) % 16 one. `int i = (e1000_rdt + 1) % RX_RING_SIZE;` this definitely matches what the LAB says but I have no idea why it's the case. It doesn't really match the ^ figure in which Tail points to a shaded box. I can also confirm that looking into GDB, the first packet is stored in descriptor 0, while rdt is 15, and the second packet is stored in descriptor 1, while rdt is 1.
 
 
-## Trial 2
+### Trial 2
 
 Damn this must be the most confusing lab I ever wrote. WTH is it talking about?
+
+### Trial 3
+
+OK with some serious discussion with ChatGPT, I finally managed to complete most of the work. `make grade` passes with 160/171 except for the final `free`, which I might take a look later.
+
+Honestly I don't enjoy this lab and I perhaps relied too much on ChatGPT. But still, I do not take any code from ChatGPT so I think it's fine.
+
+As usual, a lot of mistakes are from misunderstanding of the specifications of the lab. e.g. I managed to pass `ping0` and `ping1` without much trouble, but `ping2` took me about at least half a week.
+
+I created a buch of dumping functions to help me pinpoint the issue today, and evertually I found something weird. The `bq` queue for port `2006` and `2007` only has 0 or 1 data when `sys_recv()` is called. This is wrong -- it is supposed to have 5 items in each queue.
+
+The issue is in `e1000_recv()`. TBH I looked at every place except for this one, because it got pass `ping0` and `ping1` without trouble. The hints say: check DD and stop if it's 0. OK so I figured that I should literally break from the loop. Unfortunately I got that one wrong -- I still need to loop through all the buffers.
